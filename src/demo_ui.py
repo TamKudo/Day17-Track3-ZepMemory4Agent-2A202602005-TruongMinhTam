@@ -39,6 +39,22 @@ from src.short_term import ShortTermMemory
 from src.utils import GOLDEN_PATH, load_dataset, load_json
 from src.zep_common import get_zep_client
 
+LAYER_ORDER = ("short_term", "long_term", "episodic", "semantic")
+
+
+def _find_user(dataset: dict[str, Any], user_id: str) -> dict[str, Any] | None:
+    for user in dataset.get("users", []):
+        if user["user_id"] == user_id:
+            return user
+    return None
+
+
+def _find_session(user: dict[str, Any], thread_id: str) -> dict[str, Any] | None:
+    for session in user.get("sessions", []):
+        if session["thread_id"] == thread_id:
+            return session
+    return None
+
 LAYER_COLORS = {
     "short_term": "#2563eb",
     "long_term": "#059669",
@@ -107,8 +123,47 @@ def retrieve_for_case(
       * Keep user_id and thread_id from the loaded case.
       * Finish with memory.assemble_context(layers).
     """
-    _ = (memory, case, extra_messages, settings, ShortTermMemory)
-    raise NotImplementedError("BONUS TODO: run student retrieval for the loaded case")
+    user_id = case["user_id"]
+    thread_id = case["thread_id"]
+    query = case["query"]
+
+    # 1) Short-term: seed from fixture_messages if present, else from the
+    #    matching user/thread in data/sessions.json, then append chat turns
+    #    the user has typed so far in this UI session.
+    stm = ShortTermMemory(strategy="sliding", max_recent_messages=6, pressure_tokens=450)
+    messages = case.get("fixture_messages")
+    if not messages:
+        dataset = load_dataset()
+        user = _find_user(dataset, user_id)
+        session = _find_session(user, thread_id) if user else None
+        messages = (session or {}).get("messages", [])
+    for msg in messages or []:
+        stm.add(msg["role"], msg["content"])
+    for msg in extra_messages or []:
+        stm.add(msg["role"], msg["content"])
+    short_term_text = stm.render()
+
+    # 2) Decide which layers to fetch for this case.
+    expected_layer = case.get("expected_layer", "")
+    if expected_layer == "mixed":
+        wanted = case.get("retrieve_layers") or ["long_term", "semantic"]
+    elif expected_layer in LAYER_ORDER:
+        wanted = [expected_layer]
+    else:
+        wanted = []
+
+    layers: dict[str, str] = {layer: "" for layer in LAYER_ORDER}
+    if "short_term" in wanted:
+        layers["short_term"] = short_term_text
+    if "long_term" in wanted:
+        layers["long_term"] = memory.retrieve_long_term(user_id, thread_id, query)
+    if "episodic" in wanted:
+        layers["episodic"] = memory.retrieve_episodic(user_id, query)
+    if "semantic" in wanted:
+        layers["semantic"] = memory.retrieve_semantic(settings.semantic_graph_id, query)
+
+    merged_context, budget = memory.assemble_context(layers)
+    return {"merged_context": merged_context, "layers": layers, "budget": budget}
 
 
 def main() -> None:
